@@ -1,0 +1,14 @@
+.git
+.gitignore
+__pycache__
+**/__pycache__
+**/*.pyc
+**/*.pyo
+*.egg-info
+**/*.egg-info
+nohup.out
+**/nohup.out
+docs
+*.md
+!requirements.txt
+

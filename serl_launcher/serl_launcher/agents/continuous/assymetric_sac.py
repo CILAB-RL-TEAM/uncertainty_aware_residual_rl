@@ -71,6 +71,8 @@ class SACAgent(flax.struct.PyTreeNode):
     def forward_policy(
         self,
         observations: Data,
+        actions: jax.Array,
+        action_stds: jax.Array,
         rng: Optional[PRNGKey] = None,
         *,
         grad_params: Optional[Params] = None,
@@ -85,6 +87,8 @@ class SACAgent(flax.struct.PyTreeNode):
         return self.state.apply_fn(
             {"params": grad_params or self.state.params},
             observations,
+            actions,
+            action_stds,
             name="actor",
             rngs={"dropout": rng} if train else {},
             train=train,
@@ -120,7 +124,7 @@ class SACAgent(flax.struct.PyTreeNode):
         batch_size = batch["rewards"].shape[0]
 
         next_action_distributions = self.forward_policy(
-            batch["next_observations"], rng=rng
+            batch["next_observations"], batch["next_base_actions"], batch["next_base_action_stds"], rng=rng
         )
         (
             next_actions,
@@ -200,7 +204,7 @@ class SACAgent(flax.struct.PyTreeNode):
 
         rng, policy_rng, sample_rng, critic_rng = jax.random.split(rng, 4)
         action_distributions = self.forward_policy(
-            batch["observations"], rng=policy_rng, grad_params=params
+            batch["observations"], batch["base_actions"], batch["base_action_stds"], rng=policy_rng, grad_params=params
         )
         actions, log_probs = action_distributions.sample_and_log_prob(seed=sample_rng)
 
@@ -312,6 +316,8 @@ class SACAgent(flax.struct.PyTreeNode):
     def sample_actions(
         self,
         observations: Data,
+        actions: jax.Array,
+        action_stds: jax.Array,
         *,
         seed: Optional[PRNGKey] = None,
         argmax: bool = False,
@@ -322,7 +328,7 @@ class SACAgent(flax.struct.PyTreeNode):
         The internal RNG will not be updated.
         """
 
-        dist = self.forward_policy(observations, rng=seed, train=False)
+        dist = self.forward_policy(observations, actions, action_stds, rng=seed, train=False)
         if argmax:
             assert seed is None, "Cannot specify seed when sampling deterministically"
             return dist.mode()
@@ -335,6 +341,7 @@ class SACAgent(flax.struct.PyTreeNode):
         rng: PRNGKey,
         observations: Data,
         actions: jnp.ndarray,
+        action_stds: jnp.ndarray,
         # Models
         actor_def: nn.Module,
         critic_def: nn.Module,
@@ -385,7 +392,7 @@ class SACAgent(flax.struct.PyTreeNode):
         """
         params = model_def.init(
             init_rng,
-            actor=[observations],
+            actor=[observations, actions, action_stds],
             critic=[observations, actions],
             temperature=[],
         )["params"]
@@ -492,6 +499,7 @@ class SACAgent(flax.struct.PyTreeNode):
             rng,
             observations,
             actions,
+            jnp.zeros_like(actions),
             actor_def=policy_def,
             critic_def=critic_def,
             temperature_def=temperature_def,
@@ -550,6 +558,7 @@ class SACAgent(flax.struct.PyTreeNode):
             rng,
             observations,
             actions,
+            jnp.zeros_like(actions),
             actor_def=policy_def,
             critic_def=critic_def,
             temperature_def=temperature_def,

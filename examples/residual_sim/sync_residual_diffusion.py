@@ -69,9 +69,10 @@ flags.DEFINE_string("data_file", "", "data file to compute the distance to data 
 flags.DEFINE_string("normalization_path", None, "Normalization file for diffusion policy")
 flags.DEFINE_string("diffuision_config_path", None, "Config file for diffusion policy")
 flags.DEFINE_integer("normalize_reward", 1, "If we want to normalize reward for kitchen envs")
+flags.DEFINE_integer("n_diffusion_samples", 10, "Number of stochastic diffusion samples for action distribution estimation.")
 flags.DEFINE_boolean(
     "debug", False, "Debug mode."
-)  
+)
 
 devices = jax.local_devices()
 num_devices = len(devices)
@@ -133,26 +134,29 @@ def train_loop(agent: SACAgent, replay_buffer, env, eval_env, sampling_rng, wand
     training_data = np.load(FLAGS.data_file)
     final_data = training_data["states"]
 
-    def get_base_action(obs):
-        """Get action from diffusion policy given observation.
-        
+    def get_base_action_dist(obs):
+        """Sample N stochastic actions from diffusion policy and return mean and std.
+
         Args:
             obs: Current observation from the environment.
-            
+
         Returns:
-            Action sampled from the diffusion policy.
+            Tuple of (mean, std) over N sampled actions, both in unnormalized action space.
         """
-        ## Get action from the diffusion policy
         state = normalize_obs(obs)
-        cond = {"state": torch.from_numpy(state).float().to(device)}
-        cond["state"] = torch.unsqueeze(cond["state"], 0)
-        cond["state"] = torch.unsqueeze(cond["state"], 0)
-        samples = diffusion_policy(cond=cond, deterministic=True)
-        act = samples.trajectories[0,0]
-        act = torch.Tensor.cpu(act)
-        act = act.numpy()
-        base_action = unnormalize_action(act)
-        return base_action
+        # Build cond with batch dim N for parallel stochastic sampling: (N, To=1, obs_dim)
+        state_tensor = torch.from_numpy(state).float().to(device)
+        state_tensor = state_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, obs_dim)
+        state_tensor = state_tensor.expand(FLAGS.n_diffusion_samples, -1, -1)  # (N, 1, obs_dim)
+        cond = {"state": state_tensor}
+        with torch.no_grad():
+            samples = diffusion_policy(cond=cond, deterministic=False)
+        # trajectories: (N, Ta, Da) — take first action step
+        acts = samples.trajectories[:, 0, :].cpu().numpy()  # (N, Da)
+        acts = unnormalize_action(acts)  # (N, Da)
+        mean = acts.mean(axis=0)  # (Da,)
+        std = acts.std(axis=0)    # (Da,)
+        return mean, std
     
 
     obs, _ = env.reset()
@@ -162,16 +166,21 @@ def train_loop(agent: SACAgent, replay_buffer, env, eval_env, sampling_rng, wand
     #training loop
     timer = Timer()
     running_return = 0.0
-    next_base_action = None
-  
+    # Cache: reuse next step's diffusion result as current step's base action
+    # to avoid computing diffusion twice for the same observation.
+    cached_base_action = None
+    cached_base_action_std = None
+
     for step in tqdm.tqdm(range(FLAGS.max_steps), dynamic_ncols=True):
         timer.tick("total")
         ## Set exponentially decaying threshold
         threshold = FLAGS.uncertainty_threshold * np.exp(-step/FLAGS.uncertainty_decay_rate)
 
         with timer.context("sample_actions"):
-            #get base action  
-            base_action = get_base_action(obs)
+            if cached_base_action is not None:
+                base_action, base_action_std = cached_base_action, cached_base_action_std
+            else:
+                base_action, base_action_std = get_base_action_dist(obs)
 
             #We initially run only the base policy without any residual for some "burn in" steps.
             if step < FLAGS.burn_in_steps:
@@ -181,6 +190,8 @@ def train_loop(agent: SACAgent, replay_buffer, env, eval_env, sampling_rng, wand
                 sampling_rng, key = jax.random.split(sampling_rng)
                 policy_actions = agent.sample_actions(
                     observations=jax.device_put(obs),
+                    actions=jax.device_put(base_action),
+                    action_stds=jax.device_put(base_action_std),
                     seed=key,
                     deterministic=False,
                 )
@@ -202,28 +213,34 @@ def train_loop(agent: SACAgent, replay_buffer, env, eval_env, sampling_rng, wand
             reward = np.asarray(reward, dtype=np.float32)
             info = np.asarray(info)
             running_return += reward
-            next_base_action = get_base_action(next_obs)
-            
+            next_base_action, next_base_action_std = get_base_action_dist(next_obs)
+
             transition = dict(
                 observations=obs,
                 actions=actions, ## Critic learns with the actions taken in the environment
                 base_actions=base_action,
+                base_action_stds=base_action_std,
                 next_base_actions=next_base_action,
+                next_base_action_stds=next_base_action_std,
                 next_base_log_prob=0,
                 next_observations=next_obs,
                 rewards=reward,
                 masks=1.0 - done,
                 dones=done,
             )
-            
+
             replay_buffer.insert(transition)
 
             obs = next_obs
             if done or truncated:
                 running_return = 0.0
                 obs, _ = env.reset()
-                next_base_action = None
+                cached_base_action = None
+                cached_base_action_std = None
                 diffusion_policy.eval()
+            else:
+                cached_base_action = next_base_action
+                cached_base_action_std = next_base_action_std
         
         ## Actor-Critic Update
         with timer.context("learner"):
@@ -249,23 +266,27 @@ def train_loop(agent: SACAgent, replay_buffer, env, eval_env, sampling_rng, wand
         ## For evaluation
         def residual_action(obs):
             """Compute final action using residual policy based on distance to training data.
-            
+
             If observation is close to training data distribution, uses base policy only.
             Otherwise, adds residual policy action to base action.
-            
+
             Args:
                 obs: Current observation from the environment.
-                
+
             Returns:
                 Tuple of (action, base_action_used) where action is the final action
                 to take and base_action_used is 1 if only base policy was used, 0 otherwise.
             """
-            base_action = get_base_action(obs)
-            
-            policy_actions = agent.sample_actions(observations=jax.device_put(obs), argmax=True)
+            base_action, base_action_std = get_base_action_dist(obs)
+
+            policy_actions = agent.sample_actions(
+                observations=jax.device_put(obs),
+                actions=jax.device_put(base_action),
+                action_stds=jax.device_put(base_action_std),
+                argmax=True,
+            )
             policy_actions = np.asarray(jax.device_get(policy_actions))
 
-            ##Same conditional logic as above for calculating final action
             dist = np.square(final_data-obs)
             dist = np.sum(dist, axis=1)
             dist = dist/dist.shape[0]
@@ -273,9 +294,9 @@ def train_loop(agent: SACAgent, replay_buffer, env, eval_env, sampling_rng, wand
                 actions = policy_actions + base_action
                 base_action_used = 0
             else:
-                actions =  base_action
+                actions = base_action
                 base_action_used = 1
-            
+
             return actions, base_action_used
 
         if step % FLAGS.eval_period == 0:
