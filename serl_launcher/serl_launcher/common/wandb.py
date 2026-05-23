@@ -72,7 +72,7 @@ class WandBLogger(object):
             project=self.config.project,
             entity=self.config.entity,
             group=self.config.group,
-            tags=self.config.tag,
+            tags=[self.config.tag] if self.config.tag else None,
             dir=wandb_output_dir,
             id=self.config.experiment_id,
             save_code=True,

@@ -181,6 +181,7 @@ def train_loop(agent: SACAgent, replay_buffer, env, eval_env, sampling_rng, wand
                 sampling_rng, key = jax.random.split(sampling_rng)
                 policy_actions = agent.sample_actions(
                     observations=jax.device_put(obs),
+                    actions=jax.device_put(base_action),
                     seed=key,
                     deterministic=False,
                 )
@@ -262,7 +263,11 @@ def train_loop(agent: SACAgent, replay_buffer, env, eval_env, sampling_rng, wand
             """
             base_action = get_base_action(obs)
             
-            policy_actions = agent.sample_actions(observations=jax.device_put(obs), argmax=True)
+            policy_actions = agent.sample_actions(
+                observations=jax.device_put(obs), 
+                actions=jax.device_put(base_action),
+                argmax=True,
+            )
             policy_actions = np.asarray(jax.device_get(policy_actions))
 
             ##Same conditional logic as above for calculating final action
